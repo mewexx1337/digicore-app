@@ -1,17 +1,14 @@
 import React, { useEffect, useState, useRef, useMemo } from 'react';
 import { Stage, Layer, Rect, Circle, Text, Line, Transformer, Label, Tag } from 'react-konva';
 import * as Y from 'yjs';
-import { WebsocketProvider } from 'y-websocket';
+import { WebrtcProvider } from 'y-webrtc';
 import randomColor from 'randomcolor';
 
-// --- НАСТРОЙКИ ---
-// Используем useMemo или объявляем вне компонента, чтобы объекты не пересоздавались
-const ydoc = new Y.Doc();
-const ROOM_NAME = 'project-whiteboard-v2-unique'; // Смени имя, если хочешь чистую доску
-const ymap = ydoc.getMap('elements');
+// Генерируем цвет один раз при загрузке страницы
 const USER_COLOR = randomColor();
 
 export default function App() {
+  // --- СОСТОЯНИЯ ---
   const [elements, setElements] = useState([]);
   const [cursors, setCursors] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
@@ -25,37 +22,54 @@ export default function App() {
   const stageRef = useRef(null);
   const transformerRef = useRef(null);
 
-  // Провайдер создаем один раз
-  const provider = useMemo(() => {
-    return new WebsocketProvider(
-      'wss://demos.yjs.dev', // Публичный тестовый сервер (для обучения)
-      ROOM_NAME,
-      ydoc
-    );
+  // --- ИНИЦИАЛИЗАЦИЯ YJS (useMemo гарантирует, что соединение не создастся дважды) ---
+  const { ydoc, ymap, provider } = useMemo(() => {
+    const doc = new Y.Doc();
+    const map = doc.getMap('elements');
+    const ROOM_NAME = 'super-unique-board-2024-v1'; // Смени на свое уникальное имя!
+    
+    const webrtcProvider = new WebrtcProvider(ROOM_NAME, doc, {
+      signaling: [
+        'wss://y-webrtc-signaling-eu.herokuapp.com',
+        'wss://y-webrtc-signaling-us.herokuapp.com',
+        'wss://signaling.yjs.dev'
+      ],
+      // STUN сервера помогают пробиться через NAT роутеров
+      peerOpts: {
+        config: {
+          iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' },
+            { urls: 'stun:stun2.l.google.com:19302' }
+          ]
+        }
+      }
+    });
+
+    return { ydoc: doc, ymap: map, provider: webrtcProvider };
   }, []);
 
   useEffect(() => {
-    // 1. Подписка на изменения элементов в Y.Map
-    const updateElements = () => {
+    // Обновление элементов
+    const syncElements = () => {
       setElements(Array.from(ymap.values()));
     };
-    ymap.observe(updateElements);
-    updateElements();
 
-    // 2. Логика курсоров (Awareness)
-    const awareness = provider.awareness;
-    
-    const updateCursors = () => {
-      const states = Array.from(awareness.getStates().entries());
+    ymap.observe(syncElements);
+    syncElements();
+
+    // Обновление курсоров
+    const syncCursors = () => {
+      const states = Array.from(provider.awareness.getStates().entries());
       const others = states
-        .filter(([clientId, state]) => clientId !== awareness.clientID && state.user)
+        .filter(([clientId, state]) => clientId !== provider.awareness.clientID && state.user)
         .map(([clientId, state]) => ({ ...state.user, id: clientId }));
       setCursors(others);
     };
 
-    awareness.on('change', updateCursors);
+    provider.awareness.on('change', syncCursors);
 
-    // Удаление по кнопке
+    // Удаление элементов
     const handleKeyDown = (e) => {
       if ((e.key === 'Delete' || e.key === 'Backspace') && selectedId) {
         ymap.delete(selectedId);
@@ -66,86 +80,58 @@ export default function App() {
     window.addEventListener('keydown', handleKeyDown);
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
-      ymap.unobserve(updateElements);
-      awareness.off('change', updateCursors);
+      ymap.unobserve(syncElements);
+      provider.awareness.off('change', syncCursors);
     };
-  }, [selectedId, provider]);
+  }, [ymap, provider, selectedId]);
 
-  // Трансформер (рамка выделения)
+  // Трансформер для выделения
   useEffect(() => {
     if (selectedId && transformerRef.current) {
-      const selectedNode = stageRef.current.findOne('.' + selectedId);
-      if (selectedNode) {
-        transformerRef.current.nodes([selectedNode]);
-        transformerRef.current.getLayer().batchDraw();
+      const node = stageRef.current.findOne('.' + selectedId);
+      if (node) {
+        transformerRef.current.nodes([node]);
       } else {
         transformerRef.current.nodes([]);
       }
+      transformerRef.current.getLayer().batchDraw();
     }
   }, [selectedId, elements]);
 
+  // --- ОБРАБОТЧИКИ ---
   const handleJoin = () => {
     if (!username.trim()) return alert("Введите имя!");
     setIsJoined(true);
-    
-    // Устанавливаем начальное состояние пользователя
     provider.awareness.setLocalStateField('user', { 
-      name: username, 
-      color: USER_COLOR, 
-      x: 0, 
-      y: 0 
+      name: username, color: USER_COLOR, x: 0, y: 0 
     });
   };
 
-  const getRelativePointerPosition = (node) => {
-    const transform = node.getAbsoluteTransform().copy().invert();
-    const pos = node.getStage().getPointerPosition();
-    return transform.point(pos);
-  };
-
-  const handleWheel = (e) => {
-    e.evt.preventDefault();
-    const scaleBy = 1.1;
-    const stage = stageRef.current;
-    const oldScale = stage.scaleX();
-    const pointer = stage.getPointerPosition();
-    const mousePointTo = {
-      x: (pointer.x - stage.x()) / oldScale,
-      y: (pointer.y - stage.y()) / oldScale,
-    };
-    const newScale = e.evt.deltaY < 0 ? oldScale * scaleBy : oldScale / scaleBy;
-    setStageScale(newScale);
-    setStagePos({
-      x: pointer.x - mousePointTo.x * newScale,
-      y: pointer.y - mousePointTo.y * newScale,
-    });
+  const getPos = (e) => {
+    const stage = e.target.getStage();
+    const transform = stage.getAbsoluteTransform().copy().invert();
+    return transform.point(stage.getPointerPosition());
   };
 
   const handleMouseDown = (e) => {
-    const stage = e.target.getStage();
-    if (tool === 'select' && e.target === stage) {
+    if (tool === 'select' && e.target === e.target.getStage()) {
       setSelectedId(null);
       return;
     }
-    const pos = getRelativePointerPosition(stage);
-    const id = `el_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    if (tool === 'select') return;
+
+    const pos = getPos(e);
+    const id = `el_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
 
     if (tool === 'pencil') {
       isDrawing.current = id;
-      ymap.set(id, {
-        id, type: 'line', points: [pos.x, pos.y], color: USER_COLOR, strokeWidth: 5,
-      });
-    } else if (tool !== 'select') {
-      const newShape = {
-        id, type: tool, x: pos.x, y: pos.y, width: 100, height: 100, rotation: 0, color: USER_COLOR, text: tool === 'text' ? 'Текст' : '',
+      ymap.set(id, { id, type: 'line', points: [pos.x, pos.y], color: USER_COLOR, strokeWidth: 5 });
+    } else {
+      const shape = {
+        id, type: tool, x: pos.x, y: pos.y, width: 100, height: 100, rotation: 0, color: USER_COLOR,
+        text: tool === 'text' ? (prompt("Текст:") || "Текст") : ""
       };
-      if (tool === 'text') {
-        const txt = prompt("Текст:");
-        if (!txt) return;
-        newShape.text = txt;
-        newShape.width = undefined; newShape.height = undefined;
-      }
-      ymap.set(id, newShape);
+      ymap.set(id, shape);
       setTool('select');
       setSelectedId(id);
     }
@@ -153,15 +139,12 @@ export default function App() {
 
   const handleMouseMove = (e) => {
     if (!isJoined) return;
-    const stage = stageRef.current;
-    const pos = getRelativePointerPosition(stage);
-    
-    // Обновляем положение курсора для других
-    if(pos) {
-      provider.awareness.setLocalStateField('user', { 
-        name: username, color: USER_COLOR, x: pos.x, y: pos.y 
-      });
-    }
+    const pos = getPos(e);
+
+    // Двигаем свой курсор для других
+    provider.awareness.setLocalStateField('user', { 
+      name: username, color: USER_COLOR, x: pos.x, y: pos.y 
+    });
 
     if (tool === 'pencil' && isDrawing.current) {
       const id = isDrawing.current;
@@ -171,8 +154,6 @@ export default function App() {
       }
     }
   };
-
-  const handleMouseUp = () => { isDrawing.current = false; };
 
   const handleDragEnd = (e, id) => {
     const shape = ymap.get(id);
@@ -185,66 +166,45 @@ export default function App() {
     const shape = ymap.get(id);
     if (!shape) return;
 
-    const scaleX = node.scaleX();
-    const scaleY = node.scaleY();
+    ymap.set(id, {
+      ...shape,
+      x: node.x(),
+      y: node.y(),
+      rotation: node.rotation(),
+      width: node.width() * node.scaleX(),
+      height: node.height() * node.scaleY(),
+    });
     node.scaleX(1); node.scaleY(1);
-
-    const updates = { ...shape, x: node.x(), y: node.y(), rotation: node.rotation() };
-    if (shape.type === 'text') updates.fontSize = (shape.fontSize || 20) * scaleX;
-    else if (shape.type === 'line') { updates.scaleX = scaleX; updates.scaleY = scaleY; }
-    else { 
-        updates.width = Math.max(5, node.width() * scaleX); 
-        updates.height = Math.max(5, node.height() * scaleY); 
-    }
-    ymap.set(id, updates);
   };
 
   if (!isJoined) {
     return (
-      <div style={{
-        height: '100vh', display: 'flex', flexDirection: 'column', 
-        alignItems: 'center', justifyContent: 'center', background: '#222', color: 'white', fontFamily: 'sans-serif'
-      }}>
-        <h1>🎨 Live Whiteboard</h1>
-        <input 
-          type="text" 
-          placeholder="Ваше имя..." 
-          value={username}
-          onChange={e => setUsername(e.target.value)}
-          style={{padding: 10, fontSize: 18, borderRadius: 5, border: 'none', marginBottom: 10}}
-          onKeyDown={e => e.key === 'Enter' && handleJoin()}
-        />
-        <button onClick={handleJoin} style={{padding: '10px 20px', fontSize: 18, background: '#007bff', color: 'white', border: 'none', borderRadius: 5, cursor: 'pointer'}}>Войти</button>
+      <div style={{ height: '100vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: '#1a1a1a', color: 'white', fontFamily: 'sans-serif' }}>
+        <h2>🎨 Доска "Друзья"</h2>
+        <input style={{ padding: 12, borderRadius: 8, border: 'none', marginBottom: 10, width: 250 }} placeholder="Твоё имя..." value={username} onChange={e => setUsername(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleJoin()} />
+        <button style={{ padding: '12px 24px', borderRadius: 8, background: '#4CAF50', color: 'white', border: 'none', cursor: 'pointer' }} onClick={handleJoin}>Начать рисовать</button>
       </div>
     );
   }
 
   return (
-    <div style={{width: '100vw', height: '100vh', overflow: 'hidden', background: '#f0f0f0'}}>
-      <div style={{ 
-        position: 'absolute', top: 10, left: '50%', transform: 'translateX(-50%)', 
-        zIndex: 100, background: 'white', padding: '10px 20px', 
-        borderRadius: 12, boxShadow: '0 4px 12px rgba(0,0,0,0.15)', display: 'flex', gap: 10
-      }}>
-        <button onClick={() => setTool('select')} style={{background: tool==='select'?'#ddd':'white', border:'1px solid #ccc', cursor:'pointer', padding:8, borderRadius:4}}>👆</button>
-        <button onClick={() => setTool('pencil')} style={{background: tool==='pencil'?'#ddd':'white', border:'1px solid #ccc', cursor:'pointer', padding:8, borderRadius:4}}>✏️</button>
-        <button onClick={() => setTool('rect')} style={{background: tool==='rect'?'#ddd':'white', border:'1px solid #ccc', cursor:'pointer', padding:8, borderRadius:4}}>⬜</button>
-        <button onClick={() => setTool('circle')} style={{background: tool==='circle'?'#ddd':'white', border:'1px solid #ccc', cursor:'pointer', padding:8, borderRadius:4}}>🔵</button>
-        <button onClick={() => setTool('text')} style={{background: tool==='text'?'#ddd':'white', border:'1px solid #ccc', cursor:'pointer', padding:8, borderRadius:4}}>📝</button>
-      </div>
-      
-      <div style={{position: 'absolute', bottom: 10, left: 10, color: '#666', fontSize: 12, pointerEvents: 'none', zIndex: 10}}>
-        Вы: <b>{username}</b> | Комната: {ROOM_NAME}
+    <div style={{ width: '100vw', height: '100vh', background: '#eee' }}>
+      <div style={{ position: 'absolute', top: 15, left: '50%', transform: 'translateX(-50%)', zIndex: 10, background: 'white', padding: 10, borderRadius: 15, display: 'flex', gap: 10, boxShadow: '0 4px 15px rgba(0,0,0,0.1)' }}>
+        {['select', 'pencil', 'rect', 'circle', 'text'].map(t => (
+          <button key={t} onClick={() => setTool(t)} style={{ padding: 8, cursor: 'pointer', borderRadius: 8, border: 'none', background: tool === t ? '#4CAF50' : 'transparent', color: tool === t ? 'white' : 'black' }}>
+            {t === 'select' ? '👆' : t === 'pencil' ? '✏️' : t === 'rect' ? '⬜' : t === 'circle' ? '⭕' : 'Т'}
+          </button>
+        ))}
       </div>
 
-      <Stage 
-        width={window.innerWidth} height={window.innerHeight} ref={stageRef}
-        x={stagePos.x} y={stagePos.y} scaleX={stageScale} scaleY={stageScale}
+      <Stage
+        width={window.innerWidth}
+        height={window.innerHeight}
+        ref={stageRef}
         draggable={tool === 'select'}
-        onWheel={handleWheel}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
-        onMouseUp={handleMouseUp}
+        onMouseUp={() => (isDrawing.current = false)}
       >
         <Layer>
           {elements.map((el) => {
@@ -255,19 +215,19 @@ export default function App() {
               onDragEnd: (e) => handleDragEnd(e, el.id),
               onTransformEnd: handleTransformEnd,
             };
-            if (el.type === 'rect') return <Rect {...common} width={el.width} height={el.height} fill={el.color} cornerRadius={10} stroke={selectedId === el.id ? 'blue' : ''} />;
-            if (el.type === 'circle') return <Circle {...common} width={el.width} height={el.height} fill={el.color} stroke={selectedId === el.id ? 'blue' : ''} />;
-            if (el.type === 'text') return <Text {...common} text={el.text} fontSize={el.fontSize || 20} fill={el.color} />;
+            if (el.type === 'rect') return <Rect {...common} width={el.width} height={el.height} fill={el.color} cornerRadius={5} />;
+            if (el.type === 'circle') return <Circle {...common} width={el.width} height={el.height} fill={el.color} />;
             if (el.type === 'line') return <Line {...common} points={el.points} stroke={el.color} strokeWidth={el.strokeWidth} tension={0.5} lineCap="round" lineJoin="round" />;
+            if (el.type === 'text') return <Text {...common} text={el.text} fontSize={24} fill={el.color} />;
             return null;
           })}
           <Transformer ref={transformerRef} />
           
           {cursors.map((c) => (
-             <Label key={c.id} x={c.x} y={c.y}>
-               <Tag fill={c.color} pointerDirection="down" pointerWidth={10} pointerHeight={10} cornerRadius={5} />
-               <Text text={c.name} padding={5} fill="white" fontSize={12} fontStyle="bold" />
-             </Label>
+            <Label key={c.id} x={c.x} y={c.y}>
+              <Tag fill={c.color} pointerDirection="down" pointerWidth={10} pointerHeight={10} cornerRadius={5} />
+              <Text text={c.name} padding={5} fill="white" fontSize={12} fontStyle="bold" />
+            </Label>
           ))}
         </Layer>
       </Stage>
